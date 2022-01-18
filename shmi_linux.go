@@ -1,3 +1,4 @@
+//go:build linux && cgo
 // +build linux,cgo
 
 package shm
@@ -10,10 +11,11 @@ package shm
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 int _create(const char* name, int size, int flag) {
-	mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP;
+	mode_t mode = S_IRUSR | S_IWUSR  ;
 
 	int fd = shm_open(name, flag, mode);
 	if (fd < 0) {
@@ -28,7 +30,7 @@ int _create(const char* name, int size, int flag) {
 }
 
 int Create(const char* name, int size) {
-	int flag = O_RDWR | O_CREAT;
+	int flag = O_RDWR | O_CREAT | O_EXCL;
 	return _create(name, size, flag);
 }
 
@@ -70,36 +72,40 @@ import (
 )
 
 type shmi struct {
-	name   string
-	fd     C.int
-	v      unsafe.Pointer
-	size   int32
+	cname *C.char
+	fd    C.int
+	v     unsafe.Pointer
+	size  int32
+
+	// true if this mod created the shm
 	parent bool
 }
 
 // create shared memory. return shmi object.
 func create(name string, size int32) (*shmi, error) {
-	name = "/" + name
+	cname := C.CString(name)
 
-	fd := C.Create(C.CString(name), C.int(size))
+	fd := C.Create(cname, C.int(size))
 	if fd < 0 {
-		return nil, fmt.Errorf("create")
+		return nil, fmt.Errorf("can't create file %s", name)
 	}
 
 	v := C.Map(fd, C.int(size))
 	if v == nil {
 		C.Close(fd, nil, C.int(size))
-		C.Delete(C.CString(name))
+		C.Delete(cname)
+		C.free(unsafe.Pointer(cname))
+		return nil, fmt.Errorf("can't map file")
 	}
 
-	return &shmi{name, fd, v, size, true}, nil
+	return &shmi{cname, fd, v, size, true}, nil
 }
 
 // open shared memory. return shmi object.
 func open(name string, size int32) (*shmi, error) {
-	name = "/" + name
+	cname := C.CString(name)
 
-	fd := C.Open(C.CString(name), C.int(size))
+	fd := C.Open(cname, C.int(size))
 	if fd < 0 {
 		return nil, fmt.Errorf("open")
 	}
@@ -107,10 +113,11 @@ func open(name string, size int32) (*shmi, error) {
 	v := C.Map(fd, C.int(size))
 	if v == nil {
 		C.Close(fd, nil, C.int(size))
-		C.Delete(C.CString(name))
+		C.free(unsafe.Pointer(cname))
+		return nil, fmt.Errorf("can't map file")
 	}
 
-	return &shmi{name, fd, v, size, false}, nil
+	return &shmi{cname, fd, v, size, false}, nil
 }
 
 func (o *shmi) close() error {
@@ -119,8 +126,10 @@ func (o *shmi) close() error {
 		o.v = nil
 	}
 	if o.parent {
-		C.Delete(C.CString(o.name))
+		C.Delete(o.cname)
 	}
+	C.free(unsafe.Pointer(o.cname))
+
 	return nil
 }
 
